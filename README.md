@@ -81,7 +81,7 @@ conda activate clip-hinge
 pip install -r requirements.txt
 
 # 2. 准备数据集
-# 将 CIFAR-100 或 ImageNet-R 下载/放置到 datasets/ 下，结构参考 data_manager.py
+将 CIFAR-100 或 ImageNet-R 下载/放置到 datasets/ 下，结构参考 data_manager.py
 
 # 3. 运行增量训练（以 CIFAR-100 配置为例）
 python main.py --config configs/cifar100_split.json## 关键配置说明（以 `configs/cifar100_split.json` 为例）
