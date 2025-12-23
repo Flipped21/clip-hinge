@@ -17,7 +17,11 @@ def run(args):
 def train_and_evaluate(args):
     # 创建结果文件名（包含时间戳避免覆盖）
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    result_file = f'/mnt/data0/lzx/PGP/clip-hinge/results/{args["dataset"]}/results_{timestamp}.txt'
+    e1 = args["init_epochs"]
+    e2 = args["epochs"]
+    hinge = "use_hinge" if args["use_image_hinge_loss"] else "no_hinge"
+    # result_file = f'/mnt/data0/lzx/PGP/clip-hinge/results/{args["dataset"]}/results_{timestamp}.txt'
+    result_file = f'/mnt/data0/lzx/PGP/clip-hinge/results/{args["dataset"]}/clip-hinge_{hinge}_[e1={e1}_e2={e2}]_{timestamp}.txt'
 
     data_manager = DataManager(args["dataset"], args["shuffle"], args["seed"], args["init_class"], args["increment"], args)
     args["class_order"] = data_manager._class_order
@@ -68,16 +72,24 @@ def train_and_evaluate(args):
         f.write(f"后续 epoch 数：{args['epochs']}\n")
         f.write(f"bs:{args['batch_size']}\n")
         f.write(f"prompt_length:{args['prompt_length']}\n")
-        f.write(f"使用图像Adapter:是\n")
+        # f.write(f"使用图像Adapter:是\n")
         
         # Hinge loss相关参数
-        if 'use_hinge_loss' in args:
-            f.write(f"是否使用Hinge Loss:{args.get('use_hinge_loss', False)}\n")
-            f.write(f"Hinge Margin:{args.get('hinge_margin', 0.2)}\n")
-            f.write(f"Hinge Weight:{args.get('hinge_weight', 1.0)}\n")
-            f.write(f"Hard Pair Threshold:{args.get('hard_pair_threshold', 0.8)}\n")
-            f.write(f"Top Hard Pairs:{args.get('top_hard_pairs', 20)}\n")
+        if 'text_use_hinge_loss' :
+            f.write(f"是否使用Hinge Loss:{args.get('text_use_hinge_loss', False)}\n")
+            f.write(f"Hinge Margin:{args.get('text_hinge_margin', 0.2)}\n")
+            f.write(f"Hinge Weight:{args.get('text_hinge_weight', 1.0)}\n")
+            f.write(f"Hard Pair Threshold:{args.get('text_hard_pair_threshold', 0.8)}\n")
+            f.write(f"Top Hard Pairs:{args.get('text_top_hard_pairs', 20)}\n")
         
+        if 'use_image_hinge_loss' :
+            f.write(f"是否使用Hinge Loss:{args.get('use_image_hinge_loss', False)}\n")
+            f.write(f"Hinge Margin:{args.get('image_hinge_margin', 0.2)}\n")
+            f.write(f"Hinge Weight:{args.get('image_hinge_weight', 1.0)}\n")
+            f.write(f"Hard Pair Threshold:{args.get('image_hard_pair_threshold', 0.8)}\n")
+            f.write(f"Top Hard Pairs:{args.get('image_top_hard_pairs', 20)}\n")
+        
+        f.write(f"类别回放特征数目:{args.get('samples_per_old_class', 40)}\n")
         f.write("\n\n")
         
         # 写入每次任务的grouped准确率

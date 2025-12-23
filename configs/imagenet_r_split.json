@@ -24,10 +24,21 @@
   "batch_size": 32,
   "weight_decay": 2e-4,
   "num_workers": 8,
-  "use_hinge_loss": true,
-  "hinge_margin": 0.1,
-  "hinge_weight": 0.25,
-  "hard_pair_threshold": 0.865,
-  "top_hard_pairs": 10,
-  "update_old_text_prompts": false
+
+  "text_use_hinge_loss": true,
+  "text_hinge_margin": 0.1,
+  "text_hinge_weight": 0.25,
+  "text_hard_pair_threshold": 0.865,
+  "text_top_hard_pairs": 10,
+
+  "update_old_text_prompts": true,
+
+  "use_image_adapter": false,
+  "use_image_hinge_loss": true,
+  "image_hinge_margin": 0.1,
+  "image_hard_pair_threshold": 0.865,
+  "image_top_hard_pairs": 10,
+  "image_hinge_weight": 1.0,
+  
+  "samples_per_old_class": 40
 }

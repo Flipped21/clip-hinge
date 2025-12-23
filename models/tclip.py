@@ -99,7 +99,7 @@ class Ticlip(nn.Module):
         
         return torch.cat(logits, dim=1)  # [N, total_classes]
 
-    def interface(self, images, tasks):
+    def interface(self, images, tasks, rand_val):
         logits = []
         tasks = tasks.cpu().tolist()
         # 使用图像 encoder + adapter
@@ -123,15 +123,22 @@ class Ticlip(nn.Module):
             # - Task 0 训练后: self.task = 1 (已见过1个任务)
             # - Task 1 训练后: self.task = 2 (已见过2个任务)
             # 所以 cur_id = self.task 表示已见过的任务数
-            # cur_id = self.task  # self.task 表示已见过的任务数 #TODO
-            cur_id = max(tasks)
+            if rand_val < 0.5:
+                cur_id = self.task  # self.task 表示已见过的任务数 #TODO
+            else:
+                cur_id = max(tasks)
+            # cur_id = max(tasks)
         for idx, ii in enumerate(tasks):
             if self.args["mode"] == "TIL":
                 selectedlogit.append(logits[idx][self.class_num*ii:self.class_num*ii+self.class_num])
             if self.args["mode"] == "CIL":
-                selectedlogit.append(logits[idx][:self.class_num * cur_id + self.class_num])
+                # selectedlogit.append(logits[idx][:self.class_num * cur_id + self.class_num])
                 # 选择所有已见过的类别的 logits
-                # selectedlogit.append(logits[idx][:self.class_num * cur_id])#TODO
+                if rand_val < 0.5:
+                    selectedlogit.append(logits[idx][:self.class_num * cur_id])
+                else:
+                    selectedlogit.append(logits[idx][:self.class_num * cur_id + self.class_num])#TODO
+                
         selectedlogit = torch.stack(selectedlogit)
 
         return selectedlogit

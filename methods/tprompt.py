@@ -31,18 +31,25 @@ class TPrompts(BaseLearner):
         self.num_workers = args["num_workers"]
         self.topk = 2
         self.class_num = self._network.class_num  # 每个任务的类别数  10/20
-        self.all_keys = []
+        self.all_keys = []  # 未使用，保留占位
         
-        # Hinge loss相关参数
-        self.hinge_margin = args.get("hinge_margin", 0.2)  # hinge loss的margin
-        self.hinge_weight = args.get("hinge_weight", 1.0)  # hinge loss的权重
-        self.hard_pair_threshold = args.get("hard_pair_threshold", 0.65)  # hard_pairs的距离阈值
-        self.use_hinge_loss = args.get("use_hinge_loss", True)  # 是否使用hinge loss
-        self.top_hard_pairs = args.get("top_hard_pairs", 20)  # 选取的hard-pairs数量
+        # 文本端 Hinge loss 相关参数（TEXT-Hinge）
+        self.text_use_hinge_loss = args.get("text_use_hinge_loss", True)  # 兼容旧字段
+        self.text_hinge_margin = args.get("text_hinge_margin", 0.1)  # hinge loss的margin
+        self.text_hinge_weight = args.get("text_hinge_weight", 1.0)  # hinge loss的权重
+        self.text_hard_pair_threshold = args.get("text_hard_pair_threshold", 0.865)  # text-hard-pairs 距离阈值
+        self.text_top_hard_pairs = args.get("text_top_hard_pairs", 10)  # 选取的text-hard-pairs数量
         # 是否允许旧任务的 text prompt 参与更新（用于 hinge loss）
         self.update_old_text_prompts = args.get("update_old_text_prompts", False)
-        # 每个旧类别采样的特征数量（用于训练时加入旧类别采样特征）
-        self.samples_per_old_class = args.get("samples_per_old_class", 0)  # 0表示不使用采样特征
+
+        # 图像端 Hinge loss 相关参数（IMAGE-Hinge，基于类别图像均值构造 image-hard-pairs）
+        self.use_image_hinge_loss = args.get("use_image_hinge_loss", True)
+        # 若未指定，默认与文本端的阈值/数量保持一致
+        self.image_hinge_margin = args.get("image_hinge_margin", 0.1)
+        self.image_hinge_weight = args.get("image_hinge_weight", 1.0)
+        self.image_hard_pair_threshold = args.get("image_hard_pair_threshold", 0.865)
+        self.image_top_hard_pairs = args.get("image_top_hard_pairs", 10)
+        self.samples_per_old_class = args.get("samples_per_old_class", 40)  # 0表示不使用采样特征
 
     def after_task(self):
         self._known_classes = self._total_classes
@@ -94,7 +101,7 @@ class TPrompts(BaseLearner):
                 - hard_pairs: [(old_class_id, new_class_id), ...]
                 - pairs_info: [(old_class_id, new_class_id, similarity, old_name, new_name), ...]
         """
-        if not self.use_hinge_loss or len(old_class_ids) == 0:
+        if not self.text_use_hinge_loss or len(old_class_ids) == 0:
             return [], []
         
         hard_pairs = []
@@ -119,7 +126,7 @@ class TPrompts(BaseLearner):
         for i, new_id in enumerate(new_class_ids):
             for j, old_id in enumerate(old_class_ids):
                 similarity = similarity_matrix[i, j].item()
-                if similarity > self.hard_pair_threshold:
+                if similarity > self.text_hard_pair_threshold:
                     old_name = network.get_class_name(old_id)
                     new_name = network.get_class_name(new_id)
                     pairs_info.append((old_id, new_id, similarity, old_name, new_name))
@@ -128,11 +135,125 @@ class TPrompts(BaseLearner):
         pairs_info.sort(key=lambda x: x[2], reverse=True)
         
         # 只取 top_k 的 hard-pairs
-        top_k = self.top_hard_pairs
+        top_k = self.text_top_hard_pairs
         pairs_info = pairs_info[:top_k]
         hard_pairs = [(old_id, new_id) for old_id, new_id, _, _, _ in pairs_info]
         
         return hard_pairs, pairs_info
+
+    def _compute_image_hard_pairs(self, train_loader, new_class_ids, old_class_ids):
+        """
+        基于图像端类别均值计算 hard_pairs（image-hard-pairs）
+        
+        - 旧类别均值：使用之前任务在 after_task 中保存的 class_means
+        - 新类别均值：在当前任务训练前，对 train_loader 做一次无梯度前向统计得到
+        
+        Args:
+            train_loader: 当前任务的训练 DataLoader（只包含新类别的真实样本）
+            new_class_ids: 新类别ID列表（全局ID）
+            old_class_ids: 旧类别ID列表（全局ID）
+        
+        Returns:
+            tuple: (image_hard_pairs列表, pairs_info列表)
+                - image_hard_pairs: [(old_class_id, new_class_id), ...]
+                - pairs_info: [(old_class_id, new_class_id, similarity), ...]
+        """
+        if (not self.use_image_hinge_loss) or len(old_class_ids) == 0:
+            return [], []
+
+        network = self._network.module if isinstance(self._network, nn.DataParallel) else self._network
+        device = network.logit_scale.device
+
+        # --------- 1) 统计新类别的图像均值（只在当前任务开始时做一次） ----------
+        new_sum = {}
+        new_cnt = {}
+
+        network.eval()
+        with torch.no_grad():
+            for _, (_, inputs, targets) in enumerate(train_loader):
+                inputs = inputs.to(self._device)
+                targets = targets.to(self._device) if isinstance(targets, torch.Tensor) \
+                    else torch.tensor(targets, dtype=torch.long, device=self._device)
+
+                # 只保留当前任务的新类别（通常 train_loader 本身已是新类别，但这里再做一次保险过滤）
+                mask = (targets >= self._known_classes) & (targets < self._total_classes)
+                if mask.sum() == 0:
+                    continue
+                inputs = inputs[mask]
+                targets = targets[mask]
+
+                feats = network.image_encoder(inputs.type(network.dtype))
+                # 当前实现中通常不使用 adapter，这里不再额外通过 adapter
+                feats = feats.detach().cpu().float()
+
+                for f, t in zip(feats, targets.cpu()):
+                    cid = int(t.item())
+                    if cid not in new_sum:
+                        new_sum[cid] = f.clone()
+                        new_cnt[cid] = 1
+                    else:
+                        new_sum[cid] += f
+                        new_cnt[cid] += 1
+
+        # 只为在本任务中真正出现过的新类别计算均值
+        new_means = []
+        new_ids_effective = []
+        for cid in new_class_ids:
+            if cid in new_sum and new_cnt[cid] > 0:
+                mean = (new_sum[cid] / new_cnt[cid]).to(device)
+                new_means.append(mean)
+                new_ids_effective.append(cid)
+
+        if len(new_means) == 0:
+            return [], []
+
+        new_means = torch.stack(new_means, dim=0)  # [num_new, D]
+
+        # --------- 2) 取出旧类别的图像均值（来自历史统计） ----------
+        old_means = []
+        old_ids_effective = []
+        for cid in old_class_ids:
+            # class_means 在 Ticlip 中以全局类别ID为键保存
+            if cid in network.class_means:
+                old_means.append(network.class_means[cid].to(device))
+                old_ids_effective.append(cid)
+
+        if len(old_means) == 0:
+            return [], []
+
+        old_means = torch.stack(old_means, dim=0)  # [num_old, D]
+
+        # --------- 3) 计算图像均值之间的余弦相似度矩阵 ----------
+        # 确保 new_means 和 old_means 的 dtype 一致（CLIP 通常使用 half precision）
+        target_dtype = network.dtype if hasattr(network, "dtype") else new_means.dtype
+        new_means = new_means.to(device=device, dtype=target_dtype)
+        old_means = old_means.to(device=device, dtype=target_dtype)
+
+        new_feats = F.normalize(new_means, dim=-1)
+        old_feats = F.normalize(old_means, dim=-1)
+
+        # [num_new, num_old]
+        similarity_matrix = torch.mm(new_feats, old_feats.t())
+
+        # --------- 4) 筛选 image-hard-pairs ----------
+        pairs_info = []
+        thr = self.image_hard_pair_threshold
+
+        for i, new_id in enumerate(new_ids_effective):
+            for j, old_id in enumerate(old_ids_effective):
+                sim = similarity_matrix[i, j].item()
+                if sim > thr:
+                    pairs_info.append((old_id, new_id, sim))
+
+        # 按相似度降序排序
+        pairs_info.sort(key=lambda x: x[2], reverse=True)
+
+        # 只取 top_k 的 image-hard-pairs
+        top_k = self.image_top_hard_pairs
+        pairs_info = pairs_info[:top_k]
+        image_hard_pairs = [(old_id, new_id) for old_id, new_id, _ in pairs_info]
+
+        return image_hard_pairs, pairs_info
 
     def incremental_train(self, data_manager):
         self._cur_task += 1
@@ -194,22 +315,47 @@ class TPrompts(BaseLearner):
             self.train_function(train_loader, test_loader, optimizer, schedule)
 
     def train_function(self, train_loader, test_loader, optimizer, schedule):
-        # 计算hard_pairs（只在增量任务中使用）
+        # 计算文本端 hard_pairs（只在增量任务中使用）
         hard_pairs = []
-        if self._cur_task > 0 and self.use_hinge_loss:
+        image_hard_pairs = []
+        if self._cur_task > 0:
             # 获取新类别和旧类别的全局ID
             new_class_ids = list(range(self._known_classes, self._total_classes))
             old_class_ids = list(range(0, self._known_classes))
-            hard_pairs, pairs_info = self._compute_hard_pairs(new_class_ids, old_class_ids)
-            print(f"\n{'='*80}")
-            print(f"Using top-{len(hard_pairs)} hard pairs for task {self._cur_task} (threshold={self.hard_pair_threshold})")
-            print(f"{'='*80}")
-            if len(pairs_info) > 0:
-                print(f"{'Rank':<6} {'Old Class':<30} {'New Class':<30} {'Similarity':<12}")
-                print(f"{'-'*80}")
-                for rank, (old_id, new_id, sim, old_name, new_name) in enumerate(pairs_info, 1):
-                    print(f"{rank:<6} {old_name:<30} {new_name:<30} {sim:.4f}")
-            print(f"{'='*80}\n")
+
+            # ---------- 文本端 hard-pairs ----------
+            if self.text_use_hinge_loss:
+                hard_pairs, pairs_info = self._compute_hard_pairs(new_class_ids, old_class_ids)
+                print(f"\n{'='*80}")
+                print(f"Using top-{len(hard_pairs)} TEXT hard pairs for task {self._cur_task} "
+                      f"(threshold={self.text_hard_pair_threshold})")
+                print(f"{'='*80}")
+                if len(pairs_info) > 0:
+                    print(f"{'Rank':<6} {'Old Class':<30} {'New Class':<30} {'Similarity':<12}")
+                    print(f"{'-'*80}")
+                    for rank, (old_id, new_id, sim, old_name, new_name) in enumerate(pairs_info, 1):
+                        print(f"{rank:<6} {old_name:<30} {new_name:<30} {sim:.4f}")
+                print(f"{'='*80}\n")
+
+            # ---------- 图像端 hard-pairs（基于类别图像均值） ----------
+            if self.use_image_hinge_loss:
+                image_hard_pairs, image_pairs_info = self._compute_image_hard_pairs(
+                    train_loader, new_class_ids, old_class_ids
+                )
+                print(f"\n{'='*80}")
+                print(f"Using top-{len(image_hard_pairs)} IMAGE hard pairs for task {self._cur_task} "
+                      f"(threshold={self.image_hard_pair_threshold})")
+                print(f"{'='*80}")
+                if len(image_pairs_info) > 0:
+                    # 为了与文本端 hard-pairs 的打印保持一致，这里显示类别名称而不是 ID
+                    print(f"{'Rank':<6} {'Old Class':<30} {'New Class':<30} {'Img-Sim':<12}")
+                    print(f"{'-'*80}")
+                    network = self._network.module if isinstance(self._network, nn.DataParallel) else self._network
+                    for rank, (old_id, new_id, sim) in enumerate(image_pairs_info, 1):
+                        old_name = network.get_class_name(old_id)
+                        new_name = network.get_class_name(new_id)
+                        print(f"{rank:<6} {old_name:<30} {new_name:<30} {sim:.4f}")
+                print(f"{'='*80}\n")
         
         # 如果使用采样特征，在每个epoch开始时采样所有旧类别特征
         use_replay = self._cur_task > 0 and self.samples_per_old_class > 0
@@ -344,10 +490,13 @@ class TPrompts(BaseLearner):
                     # 使用当前任务的logits和任务内标签
                     l_ce = F.cross_entropy(logits, targets % self.class_num)
                 
-                # Hinge损失
-                l_hinge = torch.tensor(0.0, device=self._device)
-                if len(hard_pairs) > 0:
-                    hinge_list = []
+                # ---------------- Hinge 损失（文本端 + 图像端） ----------------
+                l_text_hinge = torch.tensor(0.0, device=self._device)
+                l_image_hinge = torch.tensor(0.0, device=self._device)
+
+                # 文本端 hinge：使用 text-hard-pairs
+                if self.text_use_hinge_loss and len(hard_pairs) > 0:
+                    text_hinge_list = []
                     network = self._network.module if isinstance(self._network, nn.DataParallel) else self._network
                     
                     for old_class_id, new_class_id in hard_pairs:
@@ -361,8 +510,10 @@ class TPrompts(BaseLearner):
                         new_text_prompt = network.text_prompt_pool[new_task_id]
                         new_prompts = new_text_prompt()  # [class_num, 77, 512]
                         new_tokenized = new_text_prompt.tokenized_prompts
-                        new_text_feature = network.text_encoder(new_prompts[new_class_local_id:new_class_local_id+1], 
-                                                                 new_tokenized[new_class_local_id:new_class_local_id+1])
+                        new_text_feature = network.text_encoder(
+                            new_prompts[new_class_local_id:new_class_local_id+1],
+                            new_tokenized[new_class_local_id:new_class_local_id+1]
+                        )
                         new_text_feature = new_text_feature / new_text_feature.norm(dim=-1, keepdim=True)
                         
                         # 获取旧类别的文本特征（使用冻结的text_prompts）
@@ -376,7 +527,7 @@ class TPrompts(BaseLearner):
                             old_text_feature = network.text_encoder(
                                 old_prompts[old_class_local_id:old_class_local_id+1],
                                 old_tokenized[old_class_local_id:old_class_local_id+1]
-                            ) 
+                            )
                         else:
                             with torch.no_grad():
                                 old_prompts = old_text_prompt()  # [class_num, 77, 512]
@@ -395,21 +546,83 @@ class TPrompts(BaseLearner):
                         pos_sim = torch.mm(old_image_features, old_text_feature.t())  # [20, 1]
                         
                         # 计算hinge损失
-                        hinge_loss = F.relu(neg_sim - pos_sim + self.hinge_margin).mean()
-                        hinge_list.append(hinge_loss)
+                        hinge_loss = F.relu(neg_sim - pos_sim + self.text_hinge_margin).mean()
+                        text_hinge_list.append(hinge_loss)
                     
-                    if len(hinge_list) > 0:
-                        l_hinge = torch.stack(hinge_list).mean()
+                    if len(text_hinge_list) > 0:
+                        l_text_hinge = torch.stack(text_hinge_list).mean()
+
+                # 图像端 hinge：使用 image-hard-pairs（逻辑与文本端相同，只是 pair 集不同）
+                if self.use_image_hinge_loss and len(image_hard_pairs) > 0:
+                    image_hinge_list = []
+                    network = self._network.module if isinstance(self._network, nn.DataParallel) else self._network
+
+                    for old_class_id, new_class_id in image_hard_pairs:
+                        # 采样旧类别的图像特征
+                        old_image_features = network.sample_from_gaussian(old_class_id, num_samples=20)
+                        old_image_features = old_image_features / old_image_features.norm(dim=-1, keepdim=True)
+
+                        # 获取新类别的文本特征（使用当前任务的text_prompts，可学习）
+                        new_task_id = network.task - 1  # 当前任务ID
+                        new_class_local_id = new_class_id - self._known_classes  # 转换为任务内ID
+                        new_text_prompt = network.text_prompt_pool[new_task_id]
+                        new_prompts = new_text_prompt()  # [class_num, 77, 512]
+                        new_tokenized = new_text_prompt.tokenized_prompts
+                        new_text_feature = network.text_encoder(
+                            new_prompts[new_class_local_id:new_class_local_id+1],
+                            new_tokenized[new_class_local_id:new_class_local_id+1]
+                        )
+                        new_text_feature = new_text_feature / new_text_feature.norm(dim=-1, keepdim=True)
+
+                        # 获取旧类别的文本特征（使用冻结的text_prompts）
+                        old_task_id = old_class_id // self.class_num
+                        old_class_local_id = old_class_id % self.class_num
+                        old_text_prompt = network.text_prompt_pool[old_task_id]
+                        if self.update_old_text_prompts:
+                            old_prompts = old_text_prompt()  # [class_num, 77, 512]
+                            old_tokenized = old_text_prompt.tokenized_prompts
+                            old_text_feature = network.text_encoder(
+                                old_prompts[old_class_local_id:old_class_local_id+1],
+                                old_tokenized[old_class_local_id:old_class_local_id+1]
+                            )
+                        else:
+                            with torch.no_grad():
+                                old_prompts = old_text_prompt()  # [class_num, 77, 512]
+                                old_tokenized = old_text_prompt.tokenized_prompts
+                                old_text_feature = network.text_encoder(
+                                    old_prompts[old_class_local_id:old_class_local_id+1],
+                                    old_tokenized[old_class_local_id:old_class_local_id+1]
+                                )
+                        old_text_feature = old_text_feature / old_text_feature.norm(dim=-1, keepdim=True)
+
+                        # 确保数据类型一致（CLIP使用half precision）
+                        old_image_features = old_image_features.type(new_text_feature.dtype)
+
+                        # 计算相似度
+                        neg_sim = torch.mm(old_image_features, new_text_feature.t())  # [20, 1]
+                        pos_sim = torch.mm(old_image_features, old_text_feature.t())  # [20, 1]
+
+                        # 计算hinge损失
+                        hinge_loss = F.relu(neg_sim - pos_sim + self.image_hinge_margin).mean()
+                        image_hinge_list.append(hinge_loss)
+
+                    if len(image_hinge_list) > 0:
+                        l_image_hinge = torch.stack(image_hinge_list).mean()
                 
-                # 总损失
-                loss = l_ce + self.hinge_weight * l_hinge
+                # 总损失：CE + 文本 Hinge + 图像 Hinge
+                loss = (
+                    l_ce
+                    + self.text_hinge_weight * l_text_hinge
+                    + self.image_hinge_weight * l_image_hinge
+                )
                 
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
                 losses += loss.item()
                 ce_losses += l_ce.item()
-                hinge_losses += l_hinge.item()
+                # 记录总的 Hinge 损失（文本 + 图像）
+                hinge_losses += (l_text_hinge.item() + l_image_hinge.item())
                 num_batches += 1
                 
                 # 计算准确率
@@ -444,14 +657,15 @@ class TPrompts(BaseLearner):
         y_pred, y_true = [], []
         print("Eval Task Start.")
         for _, (tasks, inputs, targets) in enumerate(loader):
+            rand_val = np.random.rand()
             inputs = inputs.to(self._device)
             targets = targets.to(self._device)
             tasks = tasks.to(self._device)
             with torch.no_grad():
                 if isinstance(self._network, nn.DataParallel):
-                    outputs = self._network.module.interface(inputs, tasks)
+                    outputs = self._network.module.interface(inputs, tasks, rand_val)
                 else:
-                    outputs = self._network.interface(inputs, tasks)
+                    outputs = self._network.interface(inputs, tasks, rand_val)
             if self.args["mode"] == "TIL":
                 predicts = torch.max(outputs, dim=1)[1] + tasks * self.class_num
             elif self.args["mode"] == "CIL":

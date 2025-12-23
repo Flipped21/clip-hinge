@@ -12,24 +12,34 @@
   "device": ["7"],
   "seed": 1997,
   "EPSILON": 1e-8,
-  "init_epochs": 5,
+  "init_epochs": 15,
   "init_lr": 0.001,
   "init_milestones": [5, 10, 15],
   "init_lr_decay": 0.1,
   "init_weight_decay": 0.0005,
-  "epochs": 3,
+  "epochs": 15,
   "lr": 0.01,
   "milestones": [5, 10, 15],
   "lr_decay": 0.1,
   "batch_size": 50,
   "weight_decay": 2e-4,
   "num_workers": 8,
-  "use_hinge_loss": true,
-  "hinge_margin": 0.1,
-  "hinge_weight":1,
-  "hard_pair_threshold": 0.865,
-  "top_hard_pairs": 10,
+
+  "text_use_hinge_loss": false,
+  "text_hinge_margin": 0.1,
+  "text_hinge_weight": 1,
+  "text_hard_pair_threshold": 0.865,
+  "text_top_hard_pairs": 10,
+
   "update_old_text_prompts": true,
+
   "use_image_adapter": false,
+
+  "use_image_hinge_loss": true,
+  "image_hinge_margin": 0.1,
+  "image_hard_pair_threshold": 0.865,
+  "image_top_hard_pairs": 10,
+  "image_hinge_weight": 1.0,
+  
   "samples_per_old_class": 40
 }
