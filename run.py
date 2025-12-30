@@ -20,8 +20,10 @@ def train_and_evaluate(args):
     e1 = args["init_epochs"]
     e2 = args["epochs"]
     hinge = "use_hinge" if args["use_image_hinge_loss"] else "no_hinge"
+    if_second = "second" if args.get('second_stage_epochs') >0 else ""
+    if_lora = "lora" if args.get('use_lora_in_second_stage') else ""
     # result_file = f'/mnt/data0/lzx/PGP/clip-hinge/results/{args["dataset"]}/results_{timestamp}.txt'
-    result_file = f'/mnt/data0/lzx/PGP/clip-hinge/results/{args["dataset"]}/clip-hinge_{hinge}_[e1={e1}_e2={e2}]_{timestamp}.txt'
+    result_file = f'/mnt/data0/lzx/PGP/clip-hinge/results/{args["dataset"]}/clip-hinge_{hinge}_{if_second}_{if_lora}_[e1={e1}_e2={e2}]_{timestamp}.txt'
 
     data_manager = DataManager(args["dataset"], args["shuffle"], args["seed"], args["init_class"], args["increment"], args)
     args["class_order"] = data_manager._class_order
@@ -72,6 +74,16 @@ def train_and_evaluate(args):
         f.write(f"后续 epoch 数：{args['epochs']}\n")
         f.write(f"bs:{args['batch_size']}\n")
         f.write(f"prompt_length:{args['prompt_length']}\n")
+        # 二阶段超参
+        f.write(f"二阶段epoch数:{args.get('second_stage_epochs', 0)}\n")
+        f.write(f"二阶段lr:{args.get('second_stage_lr', 0)}\n")
+        f.write(f"二阶段weight_decay:{args.get('second_stage_weight_decay', 0)}\n")
+        f.write(f"二阶段logit_scale:{args.get('second_stage_logit_scale', 1.0)}\n")
+        f.write(f"二阶段fusion_weight:{args.get('second_stage_fusion_weight', 1.0)}\n")
+        f.write(f"是否使用LoRA:{args.get('use_lora_in_second_stage', False)}\n")
+        f.write(f"LoRA rank:{args.get('lora_rank', 4)}\n")
+        f.write(f"LoRA alpha:{args.get('lora_alpha', 1)}\n")
+        f.write(f"LoRA layers:{args.get('lora_layers', [0, 1, 2, 3, 4])}\n")
         # f.write(f"使用图像Adapter:是\n")
         
         # Hinge loss相关参数

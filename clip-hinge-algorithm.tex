@@ -1,0 +1,34 @@
+\SetKwInOut{KwInput}{Input}
+\SetKwInOut{KwOutput}{Output}
+
+\begin{algorithm}[h]
+  \caption{CLIP-hinge 增量学习算法}\label{algorithm}
+  \KwInput{
+          初始 CLIP 模型$\{f_{image},f_{text}\}$，任务总数$T$，训练集$\{D^t\}_{t=0}^{T-1}$，
+          文本提示$\mathbf{P}$，LoRA参数$\mathbf{W}$，分类头$\{\mathbf{C}^t\}$}
+  \SetAlgoLined
+  \For{$t=0,\ldots, T-1$}{
+    \tcc{第一阶段：训练文本提示}
+    \eIf{$t=0$}{
+      初始化$\mathbf{P}_0$，训练$E_0$个epoch\;
+      保存类别统计信息$\{\mu_c, \Sigma_c\}_{c \in C_0}$\;
+    }{
+      初始化$\mathbf{P}_t$，计算图像端 hard-pairs $\mathcal{H}_{img}$\;
+      \For{$e=1,\ldots, E$}{
+        特征回放：采样旧类别特征$\tilde{x}_c \sim \mathcal{N}(\mu_c, \Sigma_c)$，$c \in C_{0:t-1}$\;
+        计算损失$\mathcal{L} = \mathcal{L}_{CE} + \lambda_{hinge} \mathcal{L}_{hinge}^{img}$\;
+        更新$\mathbf{P}_{0:t}$\;
+      }
+      保存类别统计信息$\{\mu_c, \Sigma_c\}_{c \in C_t}$\;
+    }
+    \tcc{第二阶段：训练分类头和LoRA（$t \geq 1$）}
+    \If{$t > 0$}{
+      \If{$t=1$}{初始化LoRA模块$\mathbf{W}$并附加到$f_{image}$\;}
+      初始化分类头$\mathbf{C}^t$\;
+      \For{$e=1,\ldots, E_2$}{
+        计算$\mathcal{L}_{CE}$，更新$\mathbf{C}^t$和$\mathbf{W}$\;
+      }
+    }
+  }
+  \tcc{推理：$\text{logits} = f_{image}(x, \mathbf{W})^\top f_{text}(\cdot, \mathbf{P}) + \alpha \cdot \mathbf{C}^t(f_{image}(x, \mathbf{W}))$}
+\end{algorithm}

@@ -24,6 +24,18 @@
   "batch_size": 32,
   "weight_decay": 2e-4,
   "num_workers": 8,
+  
+  "second_stage_epochs": 5,
+  "second_stage_lr": 0.01,
+  "second_stage_weight_decay": 0.0005,
+  "second_stage_momentum": 0.9,
+  "second_stage_logit_scale": 1.0,
+  "second_stage_fusion_weight": 1.0,
+
+  "use_lora_in_second_stage": false,
+  "lora_rank": 5,
+  "lora_alpha": 1,
+  "lora_layers": [0, 1, 2, 3, 4],
 
   "text_use_hinge_loss": true,
   "text_hinge_margin": 0.1,

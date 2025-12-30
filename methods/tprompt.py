@@ -51,6 +51,12 @@ class TPrompts(BaseLearner):
         self.image_top_hard_pairs = args.get("image_top_hard_pairs", 10)
         self.samples_per_old_class = args.get("samples_per_old_class", 40)  # 0表示不使用采样特征
 
+        # 二阶段分类头训练超参
+        self.second_stage_epochs = args.get("second_stage_epochs", 0)
+        self.second_stage_lr = args.get("second_stage_lr", 1e-3)
+        self.second_stage_weight_decay = args.get("second_stage_weight_decay", 0.0)
+        self.second_stage_momentum = args.get("second_stage_momentum", 0.9)
+
     def after_task(self):
         self._known_classes = self._total_classes
         
@@ -268,9 +274,15 @@ class TPrompts(BaseLearner):
         self.val_loader = DataLoader(val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
         if len(self._multiple_gpus) > 1:
             self._network = nn.DataParallel(self._network, self._multiple_gpus)
+        # 第一阶段训练前关闭分类头融合
+        net = self._network.module if isinstance(self._network, nn.DataParallel) else self._network
+        net.fuse_classifier_logits = False
         self._train(self.train_loader, self.test_loader)
         if len(self._multiple_gpus) > 1:
             self._network = self._network.module
+        # 二阶段训练：仅从第二个任务开始
+        if self._cur_task > 0 and self.second_stage_epochs > 0:
+            self._train_second_stage(self.train_loader)
 
     def _train(self, train_loader, test_loader):
         self._network.to(self._device)
@@ -687,3 +699,100 @@ class TPrompts(BaseLearner):
             correct += (predicts.cpu() == targets % self.class_num).sum()
             total += len(inputs)
         return np.around(tensor2numpy(correct) * 100 / total, decimals=2)
+
+    def _train_second_stage(self, train_loader):
+        """第二阶段：冻结文本提示，训练图像端分类头和LoRA（如果启用）。"""
+        if self.second_stage_epochs <= 0:
+            return
+
+        network = self._network.module if isinstance(self._network, nn.DataParallel) else self._network
+        if not getattr(network, "use_second_stage", False):
+            return
+
+        network.to(self._device)
+        task_id = network.task - 1  # 当前任务ID
+        network._ensure_classifier(task_id)
+        classifier = network.image_classifiers[task_id]
+
+        # 如果启用LoRA且在第二个任务（第一次使用LoRA），初始化LoRA模块
+        use_lora = getattr(network, "use_lora_in_second_stage", False)
+        if use_lora and network.lora_modules is None:
+            network._attach_lora_modules()
+            print(f"Task {self._cur_task}: LoRA模块已附加到image encoder的transformer blocks {network.lora_layers}")
+
+        # 冻结除分类头和LoRA外的所有参数
+        for param in network.parameters():
+            param.requires_grad_(False)
+        
+        # 启用分类头参数训练
+        for param in classifier.parameters():
+            param.requires_grad_(True)
+        
+        # 如果启用LoRA，启用LoRA参数训练
+        params_to_optimize = list(classifier.parameters())
+        if use_lora and network.lora_modules is not None:
+            for lora_module in network.lora_modules.values():
+                for param in lora_module.parameters():
+                    param.requires_grad_(True)
+                params_to_optimize.extend(lora_module.parameters())
+            print(f"Task {self._cur_task}: LoRA参数已加入优化器（rank={network.lora_rank}, layers={network.lora_layers}）")
+
+        optimizer = optim.SGD(
+            params_to_optimize,
+            momentum=self.second_stage_momentum,
+            lr=self.second_stage_lr,
+            weight_decay=self.second_stage_weight_decay,
+        )
+        schedule = optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, T_max=self.second_stage_epochs)
+
+        bar = tqdm(range(self.second_stage_epochs))
+        for _, epoch in enumerate(bar):
+            classifier.train()
+            # 如果使用LoRA，确保LoRA模块处于训练模式
+            if use_lora and network.lora_modules is not None:
+                for lora_module in network.lora_modules.values():
+                    lora_module.train()
+            running_loss, correct, total = 0.0, 0, 0
+
+            for _, (_, inputs, targets) in enumerate(train_loader):
+                inputs = inputs.to(self._device)
+                targets = targets.to(self._device) if isinstance(targets, torch.Tensor) else torch.tensor(
+                    targets, dtype=torch.long, device=self._device
+                )
+
+                # 如果使用LoRA，需要计算梯度（不使用torch.no_grad）
+                # LoRA已经集成在image_encoder中，前向传播会自动使用LoRA
+                if use_lora and network.lora_modules is not None:
+                    feats = network.image_encoder(inputs.type(network.dtype))
+                else:
+                    with torch.no_grad():
+                        feats = network.image_encoder(inputs.type(network.dtype))
+                
+                if network.use_image_adapter:
+                    feats = network.image_adapter(feats)
+                feats = feats / feats.norm(dim=-1, keepdim=True)
+
+                logits = classifier(feats)
+                loss = F.cross_entropy(logits, targets % self.class_num)
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                running_loss += loss.item()
+                preds = torch.max(logits, dim=1)[1]
+                correct += preds.eq((targets % self.class_num).expand_as(preds)).cpu().sum()
+                total += len(inputs)
+
+            schedule.step()
+            avg_loss = running_loss / max(len(train_loader), 1)
+            train_acc = tensor2numpy(correct) * 100 / max(total, 1)
+            info = "Task {} Stage2 {}/{} => Loss {:.3f}, Train Acc {:.2f}".format(
+                self._cur_task, epoch + 1, self.second_stage_epochs, avg_loss, train_acc
+            )
+            bar.set_description(info)
+
+        network.mark_classifier_trained(task_id)
+        # 二阶段结束后开启分类头融合（用于后续推理/评估）
+        network.fuse_classifier_logits = True
+        network.train()

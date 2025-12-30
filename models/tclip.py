@@ -1,10 +1,12 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import copy
 import math
 
 from models.clip.prompt_learner import cfgc, load_clip_to_cpu, TextEncoder, PromptLearner
 from models.clip import clip
+from models.lora import LinearLoRA
 from datasets.class_names import cifar100_classnames, imagenet_r_classnames
 
 
@@ -20,6 +22,19 @@ class Ticlip(nn.Module):
         self.text_encoder = TextEncoder(clip_model)
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
+        self.use_second_stage = args.get("enable_second_stage", args.get("second_stage_epochs", 0) > 0)
+        self.second_stage_logit_scale = args.get("second_stage_logit_scale", 1.0)
+        self.second_stage_normalize = args.get("second_stage_normalize", True)
+        self.second_stage_fusion_weight = args.get("second_stage_fusion_weight", 1.0)
+        # 控制是否在前向中融合二阶段分类头的 logits（第一阶段训练关闭，第二阶段/推理开启）
+        self.fuse_classifier_logits = False
+
+        # LoRA 配置（仅在第二阶段使用）
+        self.use_lora_in_second_stage = args.get("use_lora_in_second_stage", False)
+        self.lora_rank = args.get("lora_rank", 4)
+        self.lora_alpha = args.get("lora_alpha", None)
+        self.lora_layers = args.get("lora_layers", [0, 1, 2, 3, 4])
+        self.lora_modules = None  # 将在第二阶段训练时初始化
 
         self.class_means = {}  # 保存每个类别的特征均值，使用字典以类别ID为键
         self.class_covs = {}   # 保存每个类别的协方差矩阵，使用字典以类别ID为键
@@ -31,6 +46,10 @@ class Ticlip(nn.Module):
             PromptLearner(self.cfg, class_names[i], self.clip_moedl)
             for i in range(args["total_tasks"])
         ])  # Text Prompt Pool
+
+        # 二阶段图像分类头（每个任务一个线性层）
+        self.image_classifiers = nn.ModuleList()
+        self.classifier_trained = []
         
         self.use_image_adapter = args["use_image_adapter"]
         # 图像 Adapter：在图像 encoder 后面添加线性层，保持输出维度不变
@@ -58,6 +77,51 @@ class Ticlip(nn.Module):
     def feature_dim(self):
         return self.image_encoder.output_dim
 
+    def _attach_lora_modules(self):
+        """为第二阶段训练附加LoRA模块到image encoder的transformer blocks。"""
+        if not self.use_lora_in_second_stage:
+            return
+        
+        visual = self.image_encoder
+        if not hasattr(visual, "transformer") or not hasattr(visual.transformer, "resblocks"):
+            print("当前视觉编码器不支持LoRA，已关闭use_lora_in_second_stage。")
+            self.use_lora_in_second_stage = False
+            return
+        
+        depth = len(visual.transformer.resblocks)
+        self.lora_layers = [l for l in self.lora_layers if l < depth]
+        if len(self.lora_layers) == 0:
+            print("LoRA层列表为空，已关闭use_lora_in_second_stage。")
+            self.use_lora_in_second_stage = False
+            return
+
+        width = getattr(visual.transformer, "width", None)
+        if width is None:
+            width = visual.transformer.resblocks[0].attn.embed_dim
+
+        self.lora_modules = nn.ModuleDict()
+        for idx in self.lora_layers:
+            lora = LinearLoRA(width, width * 3, rank=self.lora_rank, alpha=self.lora_alpha)
+            lora = lora.to(dtype=self.dtype, device=self.logit_scale.device)
+            self.lora_modules[str(idx)] = lora
+            visual.transformer.resblocks[idx].enable_lora(lora)
+
+    def set_lora_collect(self, flag: bool = True):
+        """控制是否在前向中缓存LoRA激活。"""
+        if not self.use_lora_in_second_stage:
+            return
+        visual = self.image_encoder
+        for idx in self.lora_layers:
+            visual.transformer.resblocks[idx].set_lora_collect(flag)
+    
+    def set_lora_enabled(self, flag: bool = True):
+        """临时启用/禁用LoRA（用于推理时控制第一阶段是否使用LoRA）。"""
+        if not self.use_lora_in_second_stage or self.lora_modules is None:
+            return
+        visual = self.image_encoder
+        for idx in self.lora_layers:
+            visual.transformer.resblocks[idx].use_lora = flag
+
     def forward(self, image):
         logits = []
         # 使用图像 encoder + adapter
@@ -71,6 +135,12 @@ class Ticlip(nn.Module):
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
         logit_scale = self.logit_scale.exp()
         logits.append(logit_scale * image_features @ text_features.t())  # [32, 10]
+
+        # 二阶段分类头（仅当前任务）# TODO
+        if self.fuse_classifier_logits and self._has_trained_classifier(self.task - 1):
+            cls_logits = self._classifier_logits_for_task(image_features, self.task - 1)
+            if cls_logits is not None:
+                logits[-1] = logits[-1] + self.second_stage_fusion_weight * cls_logits
         return torch.cat(logits, dim=1)
     
     def forward_all_classes(self, image_features):
@@ -96,13 +166,25 @@ class Ticlip(nn.Module):
             text_features = self.text_encoder(text_prompt(), tokenized_prompts)
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
             logits.append(logit_scale * image_features @ text_features.t())
-        
+
+        # 若有训练完毕的二阶段分类头，则叠加对应logits # TODO
+        if self.use_second_stage and self.fuse_classifier_logits and len(logits) > 0:
+            cls_logits = self._classifier_logits_all_tasks(image_features)
+            if cls_logits is not None:
+                for idx in range(min(len(logits), len(cls_logits))):
+                    logits[idx] = logits[idx] + self.second_stage_fusion_weight * cls_logits[idx]
+
         return torch.cat(logits, dim=1)  # [N, total_classes]
 
     def interface(self, images, tasks, rand_val):
         logits = []
         tasks = tasks.cpu().tolist()
-        # 使用图像 encoder + adapter
+        
+        # 第一阶段：计算CLIP输出（不使用LoRA）
+        if self.use_lora_in_second_stage and self.lora_modules is not None:
+            self.set_lora_enabled(False)
+        
+        # 使用图像 encoder + adapter（不使用LoRA）
         image_features = self.image_encoder(images.type(self.dtype))
         if self.use_image_adapter:
             image_features = self.image_adapter(image_features)  # 通过 adapter # TODO
@@ -114,6 +196,28 @@ class Ticlip(nn.Module):
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
             logit_scale = self.logit_scale.exp()
             logits.append(logit_scale * image_features @ text_features.t())
+
+        # 第二阶段：叠加分类头的输出（使用LoRA）
+        if self.use_second_stage and self.fuse_classifier_logits:
+            if self.use_lora_in_second_stage and self.lora_modules is not None:
+                # 重新启用LoRA并重新计算图像特征（用于分类头）
+                self.set_lora_enabled(True)
+                image_features_lora = self.image_encoder(images.type(self.dtype))
+                if self.use_image_adapter:
+                    image_features_lora = self.image_adapter(image_features_lora)
+                image_features_lora = image_features_lora / image_features_lora.norm(dim=-1, keepdim=True)
+            else:
+                image_features_lora = image_features
+            
+            cls_logits = self._classifier_logits_all_tasks(image_features_lora)
+            if cls_logits is not None:
+                for idx in range(min(len(logits), len(cls_logits))):
+                    logits[idx] = logits[idx] + self.second_stage_fusion_weight * cls_logits[idx]
+        else:
+            # 如果没有分类头，恢复LoRA状态（保持启用，以便后续可能的调用）
+            if self.use_lora_in_second_stage and self.lora_modules is not None:
+                self.set_lora_enabled(True)
+        
         logits = torch.cat(logits,1)
         
         selectedlogit = []
@@ -152,6 +256,9 @@ class Ticlip(nn.Module):
 
     def update_fc(self):
         self.task += 1
+        # 为当前任务初始化二阶段分类头
+        if self.use_second_stage:
+            self._ensure_classifier(self.task - 1)
 
     def copy(self):
         return copy.deepcopy(self)
@@ -317,4 +424,80 @@ class Ticlip(nn.Module):
             return text_features.squeeze(0)
         
         return text_features
+
+    # ---------------- 二阶段分类头相关工具函数 ----------------
+    def _ensure_classifier(self, task_id: int):
+        """若需要，为给定任务创建并初始化分类头。"""
+        if task_id < 0:
+            return
+        if task_id < len(self.image_classifiers):
+            return
+        classifier = nn.Linear(self.feature_dim, self.class_num, bias=False)
+        classifier = classifier.to(self.logit_scale.device).type(self.dtype)
+        self.image_classifiers.append(classifier)
+        self.classifier_trained.append(False)
+        self._reset_classifier_with_text(task_id)
+
+    def _reset_classifier_with_text(self, task_id: int):
+        """用当前任务的文本特征初始化分类头权重。"""
+        if task_id < 0 or task_id >= len(self.text_prompt_pool):
+            return
+        if task_id >= len(self.image_classifiers):
+            return
+        classifier = self.image_classifiers[task_id]
+        text_features = self._get_task_text_features(task_id)
+        if text_features is None:
+            return
+        with torch.no_grad():
+            classifier.weight.data.copy_(text_features.to(classifier.weight.device, dtype=classifier.weight.dtype))
+
+    def _get_task_text_features(self, task_id: int):
+        """获取某个任务的文本特征（使用prompt）。"""
+        if task_id < 0 or task_id >= len(self.text_prompt_pool):
+            return None
+        prompt = self.text_prompt_pool[task_id]
+        tokenized_prompts = prompt.tokenized_prompts
+        with torch.no_grad():
+            text_features = self.text_encoder(prompt(), tokenized_prompts)
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        return text_features
+
+    def _has_trained_classifier(self, task_id: int) -> bool:
+        return (
+            self.use_second_stage
+            and task_id >= 0
+            and task_id < len(self.classifier_trained)
+            and self.classifier_trained[task_id]
+        )
+
+    def mark_classifier_trained(self, task_id: int):
+        if task_id >= 0 and task_id < len(self.classifier_trained):
+            self.classifier_trained[task_id] = True
+
+    def _classifier_logits_for_task(self, image_features, task_id: int):
+        if not self._has_trained_classifier(task_id):
+            return None
+        classifier = self.image_classifiers[task_id]
+        weight = classifier.weight
+        if self.second_stage_normalize:
+            weight = F.normalize(weight, dim=-1)
+        return self.second_stage_logit_scale * (image_features @ weight.t())
+
+    def _classifier_logits_all_tasks(self, image_features):
+        """返回每个任务对应的分类头logits列表，用于与文本logits对齐后相加。"""
+        if not self.use_second_stage or len(self.image_classifiers) == 0:
+            return None
+        logits = []
+        for task_id in range(self.task):
+            cls_logit = self._classifier_logits_for_task(image_features, task_id)
+            if cls_logit is None:
+                # 若未训练则返回零张量以保持形状
+                cls_logit = torch.zeros(
+                    image_features.size(0),
+                    self.class_num,
+                    device=image_features.device,
+                    dtype=image_features.dtype,
+                )
+            logits.append(cls_logit)
+        return logits
     

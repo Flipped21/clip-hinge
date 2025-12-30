@@ -6,6 +6,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from models.lora import LinearLoRA
+
 
 class Bottleneck(nn.Module):
     expansion = 4
@@ -177,10 +179,85 @@ class ResidualAttentionBlock(nn.Module):
         ]))
         self.ln_2 = LayerNorm(d_model)
         self.attn_mask = attn_mask
+        # LoRA 相关
+        self.use_lora = False
+        self.collect_lora = False
+        self.lora_qkv: LinearLoRA = None
+        self.lora_cache = {"down": None, "up": None}
+
+    def enable_lora(self, lora_module: LinearLoRA):
+        """为当前Block注入LoRA。"""
+        self.lora_qkv = lora_module
+        self.use_lora = True
+
+    def set_lora_collect(self, flag: bool):
+        """控制是否在前向中缓存LoRA激活。"""
+        self.collect_lora = flag
+        self.lora_cache = {"down": None, "up": None}
 
     def attention(self, x: torch.Tensor):
-        self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
-        return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
+        attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
+
+        # 无LoRA时，直接使用原始MultiheadAttention
+        if not (self.use_lora and self.lora_qkv is not None):
+            return self.attn(x, x, x, need_weights=False, attn_mask=attn_mask)[0]
+
+        # 标准LoRA实现：使用残差连接而非修改权重
+        # 注意：x 是 LND 格式 [seq_len, batch_size, embed_dim]
+        embed_dim = self.attn.embed_dim
+        num_heads = self.attn.num_heads
+        head_dim = embed_dim // num_heads
+        seq_len, batch_size = x.size(0), x.size(1)
+        
+        # 1. 计算基础QKV投影输出 [seq_len, batch_size, 3 * embed_dim]
+        base_qkv = F.linear(x, self.attn.in_proj_weight, self.attn.in_proj_bias)
+        
+        # 2. 计算LoRA输出（标准残差方式）
+        # 缓存激活值（用于特征收集）
+        self.lora_qkv.cache_activations(x)
+        lora_up = self.lora_qkv.lora_A(x)
+        lora_qkv_output = self.lora_qkv.lora_B(lora_up) * self.lora_qkv.scaling
+        
+        # 如果启用收集模式，保存激活值
+        if self.collect_lora:
+            self.lora_cache["down"] = self.lora_qkv.down_
+            self.lora_cache["up"] = self.lora_qkv.up_
+        
+        # 3. 将LoRA输出加到基础输出上（残差连接）
+        qkv = base_qkv + lora_qkv_output  # [seq_len, batch_size, 3 * embed_dim]
+        
+        # 4. 分割QKV并重新组织维度
+        # qkv: [seq_len, batch_size, 3 * embed_dim] -> [seq_len, batch_size, 3, num_heads, head_dim]
+        qkv = qkv.reshape(seq_len, batch_size, 3, num_heads, head_dim)
+        # 重排为: [3, seq_len, batch_size, num_heads, head_dim]
+        qkv = qkv.permute(2, 0, 1, 3, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # 每个都是 [seq_len, batch_size, num_heads, head_dim]
+        
+        # 5. 计算注意力分数
+        # 需要转置以匹配 PyTorch MultiheadAttention 的内部格式
+        # 转置为: [batch_size, num_heads, seq_len, head_dim] 以便计算注意力
+        q = q.permute(1, 2, 0, 3)  # [batch_size, num_heads, seq_len, head_dim]
+        k = k.permute(1, 2, 0, 3)  # [batch_size, num_heads, seq_len, head_dim]
+        v = v.permute(1, 2, 0, 3)  # [batch_size, num_heads, seq_len, head_dim]
+        
+        scale = 1.0 / (head_dim ** 0.5)
+        attn = (q @ k.transpose(-2, -1)) * scale  # [batch_size, num_heads, seq_len, seq_len]
+        
+        if attn_mask is not None:
+            attn = attn + attn_mask
+            
+        attn = F.softmax(attn, dim=-1)
+        attn = F.dropout(attn, p=self.attn.dropout, training=self.training)
+        
+        # 6. 应用注意力到value
+        out = attn @ v  # [batch_size, num_heads, seq_len, head_dim]
+        # 重组: [batch_size, num_heads, seq_len, head_dim] -> [batch_size, seq_len, num_heads, head_dim] -> [batch_size, seq_len, embed_dim] -> [seq_len, batch_size, embed_dim]
+        out = out.transpose(1, 2).contiguous().reshape(batch_size, seq_len, embed_dim).permute(1, 0, 2)
+        
+        # 7. 输出投影
+        attn_output = F.linear(out, self.attn.out_proj.weight, self.attn.out_proj.bias)
+        
+        return attn_output
 
     def forward(self, x: torch.Tensor):
         x = x + self.attention(self.ln_1(x))

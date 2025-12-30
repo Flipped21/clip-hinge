@@ -9,7 +9,7 @@
   "embed_dim": 768,
   "prompt_length": 10,
   "total_tasks": 10,
-  "device": ["4"],
+  "device": ["3"],
   "seed": 1997,
   "EPSILON": 1e-8,
   "init_epochs": 15,
@@ -25,7 +25,7 @@
   "weight_decay": 2e-4,
   "num_workers": 8,
   
-  "second_stage_epochs": 0,
+  "second_stage_epochs": 3,
   "second_stage_lr": 0.01,
   "second_stage_weight_decay": 0.0005,
   "second_stage_momentum": 0.9,
@@ -33,7 +33,7 @@
   "second_stage_fusion_weight": 0.3,
 
   "use_lora_in_second_stage": true,
-  "lora_rank": 10,
+  "lora_rank": 15,
   "lora_alpha": 1,
   "lora_layers": [0, 1, 2, 3, 4],
 
@@ -55,4 +55,3 @@
   
   "samples_per_old_class": 40
 }
-
